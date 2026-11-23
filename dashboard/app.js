@@ -149,7 +149,7 @@
         '<td>' + barPct(r.change_7d) + fmtPct(r.change_7d) + '</td>' +
         '<td class="mut hide-s">' + fmtAge(r.age_days) + '</td>' +
         '<td class="mut hide-s">' + fmtMult(r.model.peer_multiple) + '</td>' +
-        '<td class="implied">' + fmtUSD(r.implied_value_usd) + '</td></tr>';
+        '<td class="implied">' + fmtUSD(r.implied_value_usd) + '<div class="range">' + fmtUSD(r.implied_low_usd) + '–' + fmtUSD(r.implied_high_usd) + '</div></td></tr>';
     }).join('');
     main.innerHTML = masthead('board') +
       '<div class="controls">' +
@@ -210,26 +210,34 @@
       ['Momentum × (7d TVL change ' + (r.change_7d == null ? 'unreported' : r.change_7d.toFixed(1) + '%') + ')', '×' + m.momentum_multiplier.toFixed(2)],
       ['Maturity × (tracked ' + fmtAge(m.age_days) + ' with no token)', '×' + m.maturity_multiplier.toFixed(2)],
       ['Breadth × (' + r.chains.length + (r.chains.length === 1 ? ' chain' : ' chains') + ')', '×' + m.breadth_multiplier.toFixed(2)],
+      ['Range — low, at the peer set\'s shrunk 25th percentile', fmtUSD(r.implied_low_usd)],
+      ['Range — high, at the peer set\'s shrunk 75th percentile', fmtUSD(r.implied_high_usd)],
       ['Implied value', fmtUSD(r.implied_value_usd)]
     ];
+    var fs = r.farm_summary;
+    var planSum = '<div class="plan-sum"><span><b>' + fmtUSD(fs.cost_usd) + '</b> est. gas &amp; fees, total</span>' +
+      '<span><b>' + fs.time_hours.toFixed(1) + ' h</b> active time, total</span>' +
+      '<span><b>' + fs.weeks + ' weeks</b> plan window</span>' +
+      '<span><b>' + fmtUSD(fs.capital_usd) + '</b> capital in the position (not a fee)</span></div>';
     var plan = r.farm_steps.map(function (s) { return '<li>' + esc(s) + '</li>'; }).join('');
     var chips = r.chains.map(function (c) { return '<span class="chip">' + esc(c) + '</span>'; }).join('');
     main.innerHTML = masthead('board') +
       '<a class="back" href="#/">← Back to the board</a>' +
       '<div class="detail-head"><h2>' + esc(r.name) + '</h2><span class="cat">' + esc(r.category || 'Uncategorised') + ' · rank #' + r.rank + ' of ' + DATA.board_size + '</span>' +
       (r.watchlist ? '<span class="badge watch">watchlist</span>' : '<span class="badge early">early find — below the watchlist floor</span>') +
-      '<div class="big-implied"><div class="v">' + fmtUSD(r.implied_value_usd) + '</div><div class="k">implied value</div></div></div>' +
+      '<div class="big-implied"><div class="v">' + fmtUSD(r.implied_value_usd) + '</div><div class="k">implied value</div><div class="range-big">range ' + fmtUSD(r.implied_low_usd) + ' – ' + fmtUSD(r.implied_high_usd) + '</div></div></div>' +
       '<div class="cards">' +
       '<div class="card"><div class="v">' + fmtUSD(r.tvl_usd) + '</div><div class="k">TVL</div></div>' +
       '<div class="card"><div class="v">' + (r.change_7d == null ? 'n/a' : (r.change_7d > 0 ? '+' : '') + r.change_7d.toFixed(1) + '%') + '</div><div class="k">TVL change, 7d</div></div>' +
       '<div class="card"><div class="v">' + fmtAge(r.age_days) + '</div><div class="k">tracked, no token</div></div>' +
       '<div class="card"><div class="v">' + (r.listed_at || 'unknown') + '</div><div class="k">tracked since</div></div>' +
       '<div class="card"><div class="v">none recorded</div><div class="k">token in snapshot</div></div>' +
+      '<div class="card"><div class="v">' + fmtUSD(fs.cost_usd) + '</div><div class="k">est. farm gas &amp; fees</div></div>' +
       '</div>' +
       '<section class="panel"><h3>How the model prices ' + esc(r.name) + '</h3>' +
       '<table class="factors">' + factors.map(function (f) { return '<tr><td>' + f[0] + '</td><td class="r">' + f[1] + '</td></tr>'; }).join('') + '</table>' +
       '<p class="mut" style="font-size:13px;margin:10px 0 0">The multiple is the median market-cap/TVL of the category\'s tokenised protocols, shrunk toward the global median (' + fmtMult(DATA.global_median_multiple) + ') by the peer count. No protocol is priced by name.</p></section>' +
-      '<section class="panel"><h3>Farm plan</h3><ol class="plan">' + plan + '</ol></section>' +
+      '<section class="panel"><h3>Farm plan</h3>' + planSum + '<ol class="plan">' + plan + '</ol></section>' +
       '<section class="panel"><h3>Chains</h3><div class="chips">' + chips + '</div></section>' +
       foot();
     main.setAttribute('aria-busy', 'false');
@@ -258,6 +266,15 @@
 
   // ---------------------------------------------------------------- method
   function renderMethod() {
+    var bt = DATA.backtest;
+    function btRow(label, b) {
+      return '<tr><td class="l">' + label + '</td><td>' + b.median_abs_pct_error.toFixed(1) + '%</td><td>×' + b.median_ratio.toFixed(2) + '</td><td>' + b.within_2x_pct.toFixed(1) + '%</td></tr>';
+    }
+    var btHtml = '<h4 class="subh">Backtest — leave-one-out, on the snapshot\'s own tokenised protocols</h4>' +
+      '<p>Every tokenised protocol in the snapshot (' + bt.n + ' with a recorded market cap) was priced with itself removed from its peer set, and by the starter\'s flat 0.25 × TVL, then compared with the market cap the snapshot records:</p>' +
+      '<table class="peers"><thead><tr><th class="l">Priced by</th><th>Median abs. error</th><th>Median predicted / actual</th><th>Within 2× of actual</th></tr></thead><tbody>' +
+      btRow('This model (full formula)', bt.model) + btRow('Flat 0.25 × TVL (starter baseline)', bt.baseline) + '</tbody></table>' +
+      '<p><b>Read it honestly:</b> no TVL-only price is precise — market-cap/TVL spreads over orders of magnitude, so every model here lands a median error near 90–100%, and the flat baseline is modestly tighter on caps that already trade (' + bt.baseline.median_abs_pct_error.toFixed(1) + '% vs ' + bt.model.median_abs_pct_error.toFixed(1) + '%), while both centre near the actual (×' + bt.baseline.median_ratio.toFixed(2) + ' vs ×' + bt.model.median_ratio.toFixed(2) + '). The peer model\'s factors price a <i>launch</i> — momentum, maturity and breadth a trading cap already reflects differently — so this test calibrates the board, it does not crown it. That spread is exactly why every row carries the range below instead of a single confident number.</p>';
     var peerRows = DATA.peers.map(function (p) {
       return '<tr><td class="l">' + esc(p.category) + '</td><td>' + p.peers + '</td><td>' + (p.median_multiple == null ? '—' : fmtMult(p.median_multiple)) + '</td><td>' + fmtMult(p.used_multiple) + '</td></tr>';
     }).join('');
@@ -266,10 +283,13 @@
       '<p>The board ranks <b>every pre-token protocol in the snapshot</b> — one whose record carries no market cap, no CoinGecko id and no symbol — except exchanges and versioned pools of another protocol. ' +
       'All ' + DATA.watchlist_size + ' watchlist protocols are on it; the watchlist is a floor, and the other ' + DATA.early_size + ' rows are early finds below it. Each row\'s implied value is priced off the snapshot\'s own comparables:</p>' +
       '<div class="formula">implied = TVL × peer multiple × momentum × maturity × breadth</div>' +
+      btHtml +
       '<p><b>Peer multiple.</b> For the protocol\'s category, the median market-cap/TVL of its tokenised protocols, shrunk toward the global median (' + fmtMult(DATA.global_median_multiple) + ') with weight n/(n+4), so a category with two peers leans on the market and one with forty stands on its own. Clamped to ×0.03–×2.50. A category with no tokenised peer prices at the global median.</p>' +
       '<p><b>Momentum.</b> 1 + 0.6 × the seven-day TVL change, clamped between −50% and +100%: growth supports a richer launch price, but one hot week never doubles a valuation.</p>' +
       '<p><b>Maturity.</b> 0.75 + 0.25 × ln(1 + age)/ln(1 + 1825 days): a protocol tracked for years with no token has a record a launch can be priced on; a new one is discounted, on a curve that flattens. An unreported start date prices at the ranked set\'s median age.</p>' +
       '<p><b>Breadth.</b> 1 + 2% per extra chain, up to ten: distribution across chains is worth something at launch, and not much.</p>' +
+      '<p><b>Range.</b> Every row also carries a low–high range: the same formula priced at the category peer set\'s 25th and 75th percentile market-cap/TVL, each shrunk toward the global band (' + fmtMult(DATA.global_p25_multiple) + '–' + fmtMult(DATA.global_p75_multiple) + ') by the same n/(n+4) weight and clamped to ×0.03–×2.50. The ranking always uses the base (median) price; the range is the model\'s own measure of how far its peers disagree.</p>' +
+      '<p><b>Farm totals.</b> Each detail view heads its plan with totals added up from that plan\'s own steps: the gas and fees of every step (the weekly steps counted once per week of the hold window), the active minutes likewise, and the hold window in weeks. The capital a step puts in a position is reported separately — it stays in the position, so it is never counted as a cost.</p>' +
       '<p><b>Farm plans</b> are generated per protocol from its category, its main chain\'s gas costs, a capital size scaled to its TVL, and a hold window scaled to its age. Every step states its cost and its time. No protocol name is special-cased anywhere in the model or the plans.</p>' +
       '</div>' +
       '<div class="panel"><h3>Peer multiples by category</h3>' +
