@@ -16,6 +16,15 @@
 //   breadth    = 1 + 0.02 x min(chains - 1, 10)
 //   implied    = max(1, round(base x momentum x maturity x breadth))
 //
+// v2 (peer-multiple-3) adds three things on the same base price, all derived from the snapshot:
+//   range      = the same formula priced at the peer set's shrunk 25th and 75th percentile
+//                multiples (see peerMultiples): implied_low / implied_high bracket the base.
+//   farm meta  = every farm step carries a structured gas cost and active minutes; the row's
+//                farm_summary is their aggregate (plus the hold window, in weeks).
+//   backtest   = a leave-one-out test over the snapshot's tokenised protocols: each one's
+//                market cap is predicted with itself removed from its peer set, and the
+//                aggregate error is reported beside the flat 0.25 x TVL starter baseline's.
+//
 // The same function scores every row, and the dashboard states the whole formula with each
 // row's own four factors, so a reader can recompute any row from the snapshot alone.
 
@@ -43,7 +52,7 @@ export interface Snapshot {
 }
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'peer-multiple-2';
+export const MODEL_VERSION = 'peer-multiple-3';
 
 /** How many live-token protocols the Live view carries, by market cap. */
 export const LIVE_ROWS = 40;
@@ -70,6 +79,13 @@ export interface BoardRow {
   watchlist: boolean;
   age_days: number | null;
   implied_value_usd: number;
+  /** The confidence range: the base formula priced at the peer set's shrunk p25 / p75 multiples. */
+  implied_low_usd: number;
+  implied_high_usd: number;
+  /** Structured cost (gas/fees, USD) and active time per farm step, aligned with farm_steps. */
+  farm_step_meta: { cost_usd: number; minutes: number }[];
+  /** The farm plan's totals, aggregated from farm_step_meta plus the hold window. */
+  farm_summary: { cost_usd: number; time_hours: number; weeks: number; capital_usd: number };
   model: {
     peer_multiple: number;
     peer_count: number;
@@ -104,6 +120,13 @@ export interface PeerRow {
   used_multiple: number;
 }
 
+/** The leave-one-out backtest over the snapshot's tokenised protocols (see backtest()). */
+export interface Backtest {
+  n: number;
+  model: { median_abs_pct_error: number; median_ratio: number; within_2x_pct: number };
+  baseline: { median_abs_pct_error: number; median_ratio: number; within_2x_pct: number };
+}
+
 /** Everything the dashboard renders, from the snapshot. */
 export interface RadarData {
   as_of: string;
@@ -115,6 +138,9 @@ export interface RadarData {
   early_size: number;
   live_size: number;
   global_median_multiple: number;
+  global_p25_multiple: number;
+  global_p75_multiple: number;
+  backtest: Backtest;
   peers: PeerRow[];
   rows: RadarRow[];
   live: LiveRow[];
@@ -144,6 +170,15 @@ function median(values: number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
   const mid = sorted.length >> 1;
   return sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
+}
+
+/** A percentile of a non-empty list, linearly interpolated between closest ranks. */
+function percentile(values: number[], q: number): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  if (sorted.length === 1) return sorted[0]!;
+  const pos = (sorted.length - 1) * q;
+  const lo = Math.floor(pos);
+  return sorted[lo]! + (sorted[Math.min(lo + 1, sorted.length - 1)]! - sorted[lo]!) * (pos - lo);
 }
 
 /** Whether a protocol records no token at all. */
@@ -179,11 +214,30 @@ export function isRankable(p: SnapshotProtocol): boolean {
   );
 }
 
-/** The peer multiples: one shrunk multiple per category, from the tokenised protocols. */
-export function peerMultiples(snapshot: Snapshot): { globalMedian: number; byCategory: Map<string, { peers: number; median: number | null; used: number }> } {
+interface CategoryPeers {
+  peers: number;
+  median: number | null;
+  used: number;
+  /** Shrunk 25th / 75th percentile multiples: the confidence range's edges for this category. */
+  usedLow: number;
+  usedHigh: number;
+}
+
+/** Shrink one statistic toward its global counterpart by the peer count, then clamp. */
+function shrink(stat: number, globalStat: number, n: number): number {
+  return Math.min(MULT_CAP, Math.max(MULT_FLOOR, (n * stat + SHRINK * globalStat) / (n + SHRINK)));
+}
+
+/**
+ * The peer multiples: one shrunk multiple per category, from the tokenised protocols, plus the
+ * shrunk p25/p75 band the confidence range prices at. `excludeSlug` drops one protocol from
+ * every set it belongs to (the backtest's leave-one-out).
+ */
+export function peerMultiples(snapshot: Snapshot, excludeSlug?: string): { globalMedian: number; globalP25: number; globalP75: number; byCategory: Map<string, CategoryPeers> } {
   const ratios: number[] = [];
   const perCategory = new Map<string, number[]>();
   for (const p of snapshot.protocols) {
+    if (p.slug === excludeSlug) continue;
     if (isPreToken(p) || p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
     const ratio = p.mcap_usd / p.tvl_usd;
     ratios.push(ratio);
@@ -193,45 +247,61 @@ export function peerMultiples(snapshot: Snapshot): { globalMedian: number; byCat
     perCategory.set(cat, list);
   }
   const globalMedian = ratios.length > 0 ? median(ratios) : 0.2;
-  const byCategory = new Map<string, { peers: number; median: number | null; used: number }>();
+  const globalP25 = ratios.length > 0 ? percentile(ratios, 0.25) : globalMedian;
+  const globalP75 = ratios.length > 0 ? percentile(ratios, 0.75) : globalMedian;
+  const byCategory = new Map<string, CategoryPeers>();
   for (const [cat, list] of perCategory) {
-    const med = median(list);
-    const used = Math.min(MULT_CAP, Math.max(MULT_FLOOR, (list.length * med + SHRINK * globalMedian) / (list.length + SHRINK)));
-    byCategory.set(cat, { peers: list.length, median: med, used });
+    byCategory.set(cat, {
+      peers: list.length,
+      median: median(list),
+      used: shrink(median(list), globalMedian, list.length),
+      usedLow: shrink(percentile(list, 0.25), globalP25, list.length),
+      usedHigh: shrink(percentile(list, 0.75), globalP75, list.length),
+    });
   }
-  return { globalMedian, byCategory };
+  return { globalMedian, globalP25, globalP75, byCategory };
 }
 
-/** The multiple a category prices at: its shrunk peer median, or the global median when it has no peers. */
-function multipleFor(ctx: PeerContext, category: string | null): { multiple: number; peers: number } {
+/** The multiples a category prices at: its shrunk peer median and band, or the global set's when it has no peers. */
+function multipleFor(ctx: PeerContext, category: string | null): { multiple: number; peers: number; low: number; high: number } {
   const entry = ctx.byCategory.get(category ?? 'Uncategorised');
-  if (entry === undefined) return { multiple: Math.min(MULT_CAP, Math.max(MULT_FLOOR, ctx.globalMedian)), peers: 0 };
-  return { multiple: entry.used, peers: entry.peers };
+  if (entry === undefined) {
+    const clamp = (n: number) => Math.min(MULT_CAP, Math.max(MULT_FLOOR, n));
+    return { multiple: clamp(ctx.globalMedian), peers: 0, low: clamp(ctx.globalP25), high: clamp(ctx.globalP75) };
+  }
+  return { multiple: entry.used, peers: entry.peers, low: entry.usedLow, high: entry.usedHigh };
 }
 
 interface PeerContext {
   globalMedian: number;
-  byCategory: Map<string, { peers: number; median: number | null; used: number }>;
+  globalP25: number;
+  globalP75: number;
+  byCategory: Map<string, CategoryPeers>;
   medianAge: number;
 }
 
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
 
-/** The four factors and the implied value one protocol gets. */
+/** The four factors, the implied value one protocol gets, and its peer-band range. */
 export function impliedValue(
   p: SnapshotProtocol,
   asOf: string,
   ctx: PeerContext,
-): { implied: number; multiple: number; peers: number; momentum: number; maturity: number; breadth: number; age: number | null } {
-  const { multiple, peers } = multipleFor(ctx, p.category);
+): { implied: number; low: number; high: number; multiple: number; peers: number; momentum: number; maturity: number; breadth: number; age: number | null } {
+  const { multiple, peers, low: lowMult, high: highMult } = multipleFor(ctx, p.category);
   const age = ageDays(asOf, p.listed_at);
   const chg = p.change_7d === null ? 0 : Math.min(100, Math.max(-50, p.change_7d));
   const momentum = p.change_7d === null ? 1 : 1 + 0.6 * (chg / 100);
   const ageForModel = age ?? ctx.medianAge;
   const maturity = 0.75 + 0.25 * (Math.log(1 + Math.min(ageForModel, 1825)) / Math.log(1 + 1825));
   const breadth = 1 + 0.02 * Math.min(Math.max(p.chains.length - 1, 0), 10);
-  const implied = Math.max(1, Math.round(p.tvl_usd * multiple * momentum * maturity * breadth));
-  return { implied, multiple, peers, momentum, maturity, breadth, age };
+  const rest = momentum * maturity * breadth;
+  const implied = Math.max(1, Math.round(p.tvl_usd * multiple * rest));
+  // The range reprices the same row at the band's edges; the shrunk percentiles preserve the
+  // median's order, so low <= implied <= high holds by construction.
+  const low = Math.max(1, Math.round(p.tvl_usd * lowMult * rest));
+  const high = Math.max(1, Math.round(p.tvl_usd * highMult * rest));
+  return { implied, low, high, multiple, peers, momentum, maturity, breadth, age };
 }
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
@@ -242,36 +312,72 @@ export function buildBoard(snapshot: Snapshot): { board: BoardRow[]; ctx: PeerCo
   const watch = new Set(snapshot.watchlist);
   const rankable = snapshot.protocols.filter((p) => watch.has(p.slug) || isRankable(p));
   const ages = rankable.map((p) => ageDays(snapshot.as_of, p.listed_at)).filter((a): a is number => a !== null);
-  const ctx: PeerContext = { globalMedian: peersInfo.globalMedian, byCategory: peersInfo.byCategory, medianAge: ages.length > 0 ? median(ages) : 365 };
+  const ctx: PeerContext = { globalMedian: peersInfo.globalMedian, globalP25: peersInfo.globalP25, globalP75: peersInfo.globalP75, byCategory: peersInfo.byCategory, medianAge: ages.length > 0 ? median(ages) : 365 };
   const scored = rankable.map((p) => ({ p, v: impliedValue(p, snapshot.as_of, ctx) }));
   scored.sort((a, b) => b.v.implied - a.v.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
-  const board = scored.map((s, i) => ({
-    rank: i + 1,
-    slug: s.p.slug,
-    name: s.p.name,
-    category: s.p.category,
-    chains: s.p.chains,
-    tvl_usd: s.p.tvl_usd,
-    change_7d: s.p.change_7d,
-    mcap_usd: s.p.mcap_usd,
-    listed_at: s.p.listed_at,
-    gecko_id: s.p.gecko_id,
-    symbol: s.p.symbol,
-    token_status: 'pre-token' as const,
-    watchlist: watch.has(s.p.slug),
-    age_days: s.v.age,
-    implied_value_usd: s.v.implied,
-    model: {
-      peer_multiple: round4(s.v.multiple),
-      peer_count: s.v.peers,
-      momentum_multiplier: round4(s.v.momentum),
-      maturity_multiplier: round4(s.v.maturity),
-      breadth_multiplier: round4(s.v.breadth),
+  const board = scored.map((s, i) => {
+    const plan = farmPlan(s.p, s.v.age);
+    return {
+      rank: i + 1,
+      slug: s.p.slug,
+      name: s.p.name,
+      category: s.p.category,
+      chains: s.p.chains,
+      tvl_usd: s.p.tvl_usd,
+      change_7d: s.p.change_7d,
+      mcap_usd: s.p.mcap_usd,
+      listed_at: s.p.listed_at,
+      gecko_id: s.p.gecko_id,
+      symbol: s.p.symbol,
+      token_status: 'pre-token' as const,
+      watchlist: watch.has(s.p.slug),
       age_days: s.v.age,
-    },
-    farm_steps: farmSteps(s.p, s.v.age),
-  }));
+      implied_value_usd: s.v.implied,
+      implied_low_usd: s.v.low,
+      implied_high_usd: s.v.high,
+      farm_step_meta: plan.meta,
+      farm_summary: plan.summary,
+      model: {
+        peer_multiple: round4(s.v.multiple),
+        peer_count: s.v.peers,
+        momentum_multiplier: round4(s.v.momentum),
+        maturity_multiplier: round4(s.v.maturity),
+        breadth_multiplier: round4(s.v.breadth),
+        age_days: s.v.age,
+      },
+      farm_steps: plan.steps,
+    };
+  });
   return { board, ctx };
+}
+
+/**
+ * The leave-one-out backtest: for every tokenised protocol in the snapshot, predict its market
+ * cap with the full model while it is removed from its own peer set, and do the same with the
+ * starter's flat 0.25 x TVL. Nothing is tuned on the result; it is reported as computed.
+ * The maturity factor's fallback age is the tokenised set's own median age.
+ */
+export function backtest(snapshot: Snapshot): Backtest {
+  const tokenised = snapshot.protocols.filter((p) => !isPreToken(p) && p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
+  const ages = tokenised.map((p) => ageDays(snapshot.as_of, p.listed_at)).filter((a): a is number => a !== null);
+  const medianAge = ages.length > 0 ? median(ages) : 365;
+  const agg = (preds: number[]) => {
+    const apes = preds.map((pred, i) => Math.abs(pred - tokenised[i]!.mcap_usd!) / tokenised[i]!.mcap_usd!);
+    const ratios = preds.map((pred, i) => pred / tokenised[i]!.mcap_usd!);
+    const within = ratios.filter((r) => r >= 0.5 && r <= 2).length;
+    return {
+      median_abs_pct_error: Math.round(median(apes) * 1000) / 10,
+      median_ratio: round4(median(ratios)),
+      within_2x_pct: tokenised.length > 0 ? Math.round((within / tokenised.length) * 1000) / 10 : 0,
+    };
+  };
+  const modelPreds = tokenised.map((p) => {
+    const loo = peerMultiples(snapshot, p.slug);
+    const ctx: PeerContext = { globalMedian: loo.globalMedian, globalP25: loo.globalP25, globalP75: loo.globalP75, byCategory: loo.byCategory, medianAge };
+    return impliedValue(p, snapshot.as_of, ctx).implied;
+  });
+  const basePreds = tokenised.map((p) => Math.round(0.25 * p.tvl_usd));
+  return { n: tokenised.length, model: agg(modelPreds), baseline: agg(basePreds) };
 }
 
 // ------------------------------------------------------------- farm plans
@@ -411,15 +517,20 @@ function stepText(text: string, cost: string, time: string): string {
 /**
  * A protocol's farm plan: seven steps, each an action with a cost and a time, derived from the
  * protocol's own record (category, chains, TVL, age), never from a hand-written list of names.
+ * Each step also carries structured meta — its gas/fee cost in USD (position capital excluded:
+ * it stays in the position, and the summary reports it separately) and its active minutes,
+ * with the weekly steps counted once per week of the hold window. The summary is exactly
+ * those meta rows aggregated, so the totals a reader sees are the steps' own numbers added up.
  */
-export function farmSteps(p: SnapshotProtocol, age: number | null): string[] {
+export function farmPlan(p: SnapshotProtocol, age: number | null): { steps: string[]; meta: { cost_usd: number; minutes: number }[]; summary: { cost_usd: number; time_hours: number; weeks: number; capital_usd: number } } {
   const chain = p.chains.length > 0 ? p.chains[0]! : 'its main chain';
   const gas = gasFor(chain);
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
+  const weeks = Math.ceil(hold / 7);
   const a = actionsFor(p, capital, chain);
   const multi = p.chains.length > 1 ? ` It runs on ${p.chains.length} chains; after two weeks, repeat the core action on ${p.chains[1]} as well, because multi-chain activity is cheap breadth most farmers skip.` : '';
-  return [
+  const steps = [
     stepText(
       `Set up a fresh wallet for ${p.name} alone and fund it on ${chain} with ${money(capital + 20)} of USDC plus the chain's gas token; keep the seed phrase offline and never farm from your main wallet`,
       `about ${money(gas)} of gas to make the wallet's first transaction`,
@@ -444,6 +555,31 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): string[] {
       '20 minutes, when the time comes',
     ),
   ];
+  const round2 = (n: number): number => Math.round(n * 100) / 100;
+  // Aligned with the steps above: setup gas, core gas, second-action gas, the weekly cadence
+  // step repeated for each week of the hold, the hold itself (no fee, no active minutes), the
+  // weekly check repeated likewise, and the unwind gas.
+  const meta = [
+    { cost_usd: round2(gas), minutes: 10 },
+    { cost_usd: round2(gas * 2), minutes: 15 },
+    { cost_usd: round2(gas), minutes: 10 },
+    { cost_usd: round2(gas * weeks), minutes: 10 * weeks },
+    { cost_usd: 0, minutes: 0 },
+    { cost_usd: 0, minutes: 5 * weeks },
+    { cost_usd: round2(gas * 2), minutes: 20 },
+  ];
+  const summary = {
+    cost_usd: round2(meta.reduce((s, m) => s + m.cost_usd, 0)),
+    time_hours: Math.round((meta.reduce((s, m) => s + m.minutes, 0) / 60) * 10) / 10,
+    weeks,
+    capital_usd: capital,
+  };
+  return { steps, meta, summary };
+}
+
+/** The seven farm step strings alone (kept for callers that only need the board's text). */
+export function farmSteps(p: SnapshotProtocol, age: number | null): string[] {
+  return farmPlan(p, age).steps;
 }
 
 /** The live-token protocols, by market cap, for the dashboard's Live view. */
@@ -482,6 +618,9 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     early_size: early,
     live_size: live.length,
     global_median_multiple: round4(ctx.globalMedian),
+    global_p25_multiple: round4(ctx.globalP25),
+    global_p75_multiple: round4(ctx.globalP75),
+    backtest: backtest(snapshot),
     peers,
     rows: board,
     live,
@@ -551,6 +690,8 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
       if (t.length < 20 || t.length > 600) return `${r.slug} has a farm step of ${t.length} characters`;
     }
     if (!Number.isSafeInteger(r.implied_value_usd) || r.implied_value_usd <= 0) return `${r.slug} has implied value ${r.implied_value_usd}`;
+    if (!(r.implied_low_usd <= r.implied_value_usd && r.implied_value_usd <= r.implied_high_usd)) return `${r.slug} has a range that does not bracket its implied value`;
+    if (r.farm_step_meta.length !== steps.length) return `${r.slug} has farm meta for ${r.farm_step_meta.length} of ${steps.length} steps`;
   }
   return null;
 }
